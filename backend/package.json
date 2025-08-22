@@ -1,0 +1,118 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
+import TronWeb from "tronweb";
+import fs from "fs";
+
+dotenv.config();
+
+const {
+  TRON_PRIVATE_KEY,
+  PLAYER_ADDRESS,
+  USDT_TOKEN,
+  CONTRACT_ADDRESS,
+  BACKEND_USDT_RECEIVER,
+  TRON_FULLNODE = "https://api.trongrid.io",
+  TRON_SOLIDITY = "https://api.trongrid.io",
+  TRON_EVENT = "https://api.trongrid.io",
+  PORT = 3000
+} = process.env;
+
+if (!TRON_PRIVATE_KEY || !PLAYER_ADDRESS || !USDT_TOKEN) {
+  console.error("ضع TRON_PRIVATE_KEY و PLAYER_ADDRESS و USDT_TOKEN في .env");
+  process.exit(1);
+}
+
+const artifactPath = "./../contract/FlatDriveVault.json";
+if (!fs.existsSync(artifactPath)) {
+  console.error("ضع ABI+bytecode في contract/FlatDriveVault.json بعد الكومبايل");
+  process.exit(1);
+}
+const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+const abi = artifact.abi;
+
+const tronWeb = new TronWeb(TRON_FULLNODE, TRON_SOLIDITY, TRON_EVENT, TRON_PRIVATE_KEY);
+
+const toMicro = (v) => Math.floor(Number(v) * 1e6);
+
+let contract = null;
+async function getContract() {
+  if (!contract) {
+    if (!CONTRACT_ADDRESS) throw new Error("CONTRACT_ADDRESS غير مضبوطة في .env");
+    contract = await tronWeb.contract(abi, CONTRACT_ADDRESS);
+  }
+  return contract;
+}
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+app.get("/", (req,res)=> res.send("FlatDrive backend running"));
+
+app.get("/balances", async (req,res) => {
+  try {
+    const c = await getContract();
+    const [pb, fb, bb, cb] = await Promise.all([
+      c.playerBalance().call(),
+      c.fundBalance().call(),
+      c.backendBalance().call(),
+      c.contractTokenBalance().call()
+    ]);
+    res.json({
+      playerBalance: Number(pb)/1e6,
+      fundBalance: Number(fb)/1e6,
+      backendBalance: Number(bb)/1e6,
+      contractToken: Number(cb)/1e6,
+      player: PLAYER_ADDRESS,
+      contract: CONTRACT_ADDRESS
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/credit", async (req,res) => {
+  try {
+    const { totalUsd } = req.body;
+    if (!totalUsd || Number(totalUsd) <= 0) return res.status(400).json({ error: "totalUsd مطلوب" });
+    const c = await getContract();
+    const amount = toMicro(totalUsd);
+    const tx = await c.credit(amount).send({ feeLimit: 100_000_000 });
+    res.json({ ok: true, tx });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/withdraw", async (req,res) => {
+  try {
+    const { amount, to } = req.body;
+    if (!amount || Number(amount) < 50) return res.status(400).json({ error: "الحد الأدنى 50 USDT" });
+    if (!to || !to.startsWith("T")) return res.status(400).json({ error: "عنوان TRON غير صالح" });
+    const c = await getContract();
+    const micro = toMicro(amount);
+    const tx = await c.withdrawForPlayer(micro, to).send({ feeLimit: 100_000_000 });
+    res.json({ ok: true, tx });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/withdrawBackend", async (req,res) => {
+  try {
+    const { amount, to } = req.body;
+    const dst = to || BACKEND_USDT_RECEIVER;
+    if (!amount || Number(amount) <= 0) return res.status(400).json({ error: "amount مطلوب" });
+    if (!dst) return res.status(400).json({ error: "to مطلوب أو اضبط BACKEND_USDT_RECEIVER" });
+    const c = await getContract();
+    const micro = toMicro(amount);
+    const tx = await c.ownerWithdrawBackend(micro, dst).send({ feeLimit: 100_000_000 });
+    res.json({ ok: true, tx });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`FlatDrive backend listening on ${PORT}`));
